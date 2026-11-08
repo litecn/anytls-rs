@@ -81,7 +81,7 @@ pub async fn start_socks5_server(listen_addr: &str, client: Arc<Client>) -> Resu
 }
 
 /// Handle a single SOCKS5 connection
-async fn handle_socks5_connection(
+pub(crate) async fn handle_socks5_connection(
     mut client_conn: tokio::net::TcpStream,
     client: Arc<Client>,
 ) -> Result<()> {

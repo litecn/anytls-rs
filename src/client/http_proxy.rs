@@ -47,7 +47,7 @@ struct ParsedRequest {
     body: Vec<u8>,
 }
 
-async fn handle_http_proxy_connection(
+pub(crate) async fn handle_http_proxy_connection(
     mut client_conn: TcpStream,
     client: Arc<Client>,
 ) -> Result<()> {

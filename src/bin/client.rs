@@ -1,7 +1,9 @@
 //! AnyTLS Client binary
 
 use anyhow::{Context, Result, anyhow};
-use anytls_rs::client::{Client, SessionPoolConfig, start_http_proxy_server, start_socks5_server};
+use anytls_rs::client::{
+    Client, SessionPoolConfig, start_http_proxy_server, start_mixed_server, start_socks5_server,
+};
 use anytls_rs::padding::PaddingFactory;
 use anytls_rs::util::create_client_config;
 use std::net::IpAddr;
@@ -20,6 +22,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut listen_addr = "127.0.0.1:1080".to_string();
     let mut http_listen_addr: Option<String> = None;
+    let mut mixed_listen = false;
     let mut server_addr = "127.0.0.1:8443".to_string();
     let mut sni = None;
     let mut password = None;
@@ -47,6 +50,9 @@ async fn main() -> Result<()> {
                     args.next()
                         .context("Expected listen address after --http-listen")?,
                 );
+            }
+            "-m" | "--mixed" => {
+                mixed_listen = true;
             }
             "-I" | "--idle-session-check-interval" => {
                 let value = args
@@ -85,6 +91,9 @@ async fn main() -> Result<()> {
                 println!("  --sni SNI                 TLS SNI (optional)");
                 println!("  -H, --http-listen ADDRESS  HTTP proxy listen address (optional)");
                 println!(
+                    "  -m, --mixed               Serve SOCKS5 and HTTP on the -l address (mixed listener)"
+                );
+                println!(
                     "  -I, --idle-session-check-interval SECS  Idle session check interval (default: 30)"
                 );
                 println!(
@@ -118,6 +127,10 @@ async fn main() -> Result<()> {
 
     let password = password.context("Password is required (use -p or --password)")?;
 
+    if mixed_listen && http_listen_addr.is_some() {
+        anyhow::bail!("--mixed cannot be combined with --http-listen (mixed already serves HTTP on -l)");
+    }
+
     // Determine effective SNI / server name
     let effective_sni = match sni.as_deref() {
         Some(value) if !value.trim().is_empty() => value.trim().to_string(),
@@ -147,7 +160,9 @@ async fn main() -> Result<()> {
 
     info!("{APP_NAME} v{VERSION}");
     info!("TLS SNI host: {}", effective_sni);
-    if let Some(http_addr) = http_listen_addr.as_ref() {
+    if mixed_listen {
+        info!("MIXED (SOCKS5+HTTP) {} => {}", listen_addr, server_addr);
+    } else if let Some(http_addr) = http_listen_addr.as_ref() {
         info!(
             "SOCKS5 {} + HTTP {} => {}",
             listen_addr, http_addr, server_addr
@@ -169,7 +184,11 @@ async fn main() -> Result<()> {
     info!("Client ready");
 
     // Start proxy servers
-    if let Some(http_addr) = http_listen_addr {
+    if mixed_listen {
+        start_mixed_server(&listen_addr, client)
+            .await
+            .context("MIXED server error")?;
+    } else if let Some(http_addr) = http_listen_addr {
         let socks_addr = listen_addr.clone();
         let socks_client = Arc::clone(&client);
         let http_client = Arc::clone(&client);
