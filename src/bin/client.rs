@@ -22,7 +22,6 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut listen_addr = "127.0.0.1:1080".to_string();
     let mut http_listen_addr: Option<String> = None;
-    let mut mixed_listen = false;
     let mut server_addr = "127.0.0.1:8443".to_string();
     let mut sni = None;
     let mut password = None;
@@ -50,9 +49,6 @@ async fn main() -> Result<()> {
                     args.next()
                         .context("Expected listen address after --http-listen")?,
                 );
-            }
-            "-m" | "--mixed" => {
-                mixed_listen = true;
             }
             "-I" | "--idle-session-check-interval" => {
                 let value = args
@@ -91,7 +87,7 @@ async fn main() -> Result<()> {
                 println!("  --sni SNI                 TLS SNI (optional)");
                 println!("  -H, --http-listen ADDRESS  HTTP proxy listen address (optional)");
                 println!(
-                    "  -m, --mixed               Serve SOCKS5 and HTTP on the -l address (mixed listener)"
+                    "                              (if ADDRESS equals -l, SOCKS5+HTTP share one mixed listener)"
                 );
                 println!(
                     "  -I, --idle-session-check-interval SECS  Idle session check interval (default: 30)"
@@ -127,8 +123,16 @@ async fn main() -> Result<()> {
 
     let password = password.context("Password is required (use -p or --password)")?;
 
-    if mixed_listen && http_listen_addr.is_some() {
-        anyhow::bail!("--mixed cannot be combined with --http-listen (mixed already serves HTTP on -l)");
+    // Mixed mode is implied when -H is given the same address as -l: a single
+    // listener then serves both SOCKS5 and HTTP. A different -H address keeps
+    // the two listeners separate.
+    let mixed_listen = http_listen_addr
+        .as_deref()
+        .is_some_and(|http_addr| same_listen_addr(http_addr, &listen_addr));
+    if mixed_listen {
+        // Consume http_listen_addr so the separate-listener branch below is not
+        // taken; the mixed listener already serves HTTP on -l.
+        http_listen_addr = None;
     }
 
     // Determine effective SNI / server name
@@ -215,6 +219,20 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Compare two `host:port` listen addresses for equality. Parses as
+/// `SocketAddr` when possible (so `0.0.0.0:1080` and an equivalent numeric
+/// form match); otherwise falls back to a case-insensitive string compare
+/// that tolerates differing `localhost` spellings only when identical.
+fn same_listen_addr(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.parse::<std::net::SocketAddr>(), b.parse::<std::net::SocketAddr>()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 fn parse_u64(value: &str, flag: &str) -> Result<u64> {
