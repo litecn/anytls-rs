@@ -6,6 +6,11 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Size of the password digest sent during authentication.
+pub const PASSWORD_DIGEST_SIZE: usize = 32;
+/// Size of the fixed AnyTLS auth header: password digest + 2-byte padding length.
+pub const AUTH_HEADER_SIZE: usize = PASSWORD_DIGEST_SIZE + 2;
+
 /// Compute SHA256 hash of password
 pub fn hash_password(password: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();

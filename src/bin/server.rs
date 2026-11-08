@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use anytls_rs::padding::PaddingFactory;
-use anytls_rs::server::Server;
+use anytls_rs::server::{ForwardTarget, Server};
 use anytls_rs::util::{
     CertReloader, CertReloaderConfig, StringMap, create_server_config, set_custom_dns_servers,
 };
@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
     let mut show_cert_info = false;
     let mut expiry_warning_days: u64 = 30;
     let mut dns_servers: Vec<String> = Vec::new();
+    let mut forward_target: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -101,6 +102,12 @@ async fn main() -> Result<()> {
                 let value = args.next().context("Expected DNS server after --dns")?;
                 dns_servers.extend(parse_dns_entries(&value));
             }
+            "--forward" => {
+                forward_target = Some(
+                    args.next()
+                        .context("Expected forward URL after --forward")?,
+                );
+            }
             "-V" | "--version" => {
                 println!("{APP_NAME} {VERSION}");
                 return Ok(());
@@ -135,6 +142,11 @@ async fn main() -> Result<()> {
                 );
                 println!(
                     "      --dns SERVER           Custom DNS resolver (repeatable, comma-separated)"
+                );
+                println!();
+                println!("Forwarding Options:");
+                println!(
+                    "      --forward URL          Relay unauthenticated connections to this http(s):// URL"
                 );
                 #[cfg(unix)]
                 {
@@ -243,8 +255,20 @@ async fn main() -> Result<()> {
     };
 
     // Create and start server
-    let server =
+    let mut server =
         Server::new_with_reloadable_tls(&password, tls_acceptor_ref, padding, server_settings);
+
+    if let Some(url) = forward_target.as_deref() {
+        let target = ForwardTarget::parse(url)
+            .map_err(|e| anyhow::anyhow!("Invalid --forward URL: {e}"))?;
+        info!(
+            "[Server] Unauthenticated connections will be forwarded to {}://{}:{}",
+            if target.https { "https" } else { "http" },
+            target.host,
+            target.port
+        );
+        server = server.with_forward_target(target);
+    }
 
     // Start certificate file watching if enabled
     if let Some(ref reloader) = cert_reloader

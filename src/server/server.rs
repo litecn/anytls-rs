@@ -1,10 +1,11 @@
 //! AnyTLS Server implementation
 
 use crate::padding::PaddingFactory;
+use crate::server::forward::{ForwardTarget, read_auth_prefix, relay_forward_stream};
 use crate::server::handler::{StreamHandler, TcpProxyHandler};
 use crate::session::Session;
 use crate::util::{
-    AnyTlsError, Result, StringMap, authenticate_client, configure_tcp_stream, hash_password,
+    AnyTlsError, Result, StringMap, configure_tcp_stream, hash_password, PASSWORD_DIGEST_SIZE,
 };
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
@@ -18,6 +19,7 @@ pub struct Server {
     padding: Arc<PaddingFactory>,
     on_new_stream: Option<Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>>,
     server_settings: Option<StringMap>,
+    forward_target: Option<ForwardTarget>,
 }
 
 impl Server {
@@ -36,6 +38,7 @@ impl Server {
             padding,
             on_new_stream: None,
             server_settings,
+            forward_target: None,
         }
     }
 
@@ -54,6 +57,7 @@ impl Server {
             padding,
             on_new_stream: None,
             server_settings,
+            forward_target: None,
         }
     }
 
@@ -63,6 +67,12 @@ impl Server {
         F: Fn(Arc<crate::session::Stream>) + Send + Sync + 'static,
     {
         self.on_new_stream = Some(Arc::new(callback));
+        self
+    }
+
+    /// Relay unauthenticated connections to the given target instead of dropping them
+    pub fn with_forward_target(mut self, target: ForwardTarget) -> Self {
+        self.forward_target = Some(target);
         self
     }
 
@@ -80,6 +90,7 @@ impl Server {
                     let padding = Arc::clone(&self.padding);
                     let on_new_stream = self.on_new_stream.clone();
                     let server_settings = self.server_settings.clone();
+                    let forward_target = self.forward_target.clone();
                     let span = info_span!(
                         "anytls.connection",
                         peer_addr = %addr,
@@ -94,8 +105,7 @@ impl Server {
                                 password_hash,
                                 padding,
                                 on_new_stream,
-                                server_settings,
-                            )
+                                server_settings,                                forward_target,                            )
                             .await
                             {
                                 tracing::error!("[Server] Connection error: {}", e);
@@ -120,6 +130,7 @@ async fn handle_connection(
     padding: Arc<PaddingFactory>,
     on_new_stream: Option<Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>>,
     server_settings: Option<StringMap>,
+    forward_target: Option<ForwardTarget>,
 ) -> Result<()> {
     let peer_addr = tcp_stream
         .peer_addr()
@@ -137,7 +148,7 @@ async fn handle_connection(
     tracing::info!("[Server] New connection from {}", peer_addr);
     // Perform TLS handshake
     tracing::debug!("[Server] Starting TLS handshake");
-    let tls_stream = tls_config.accept(tcp_stream).await.map_err(|e| {
+    let mut tls_stream = tls_config.accept(tcp_stream).await.map_err(|e| {
         tracing::error!("[Server] TLS handshake failed: {}", e);
         AnyTlsError::Tls(format!("TLS handshake failed: {}", e))
     })?;
@@ -153,10 +164,38 @@ async fn handle_connection(
         );
     }
 
-    // Authenticate client
+    // Authenticate client: read the fixed auth header manually so that an
+    // unauthenticated connection can be forwarded verbatim (bytes already read
+    // are replayed to the forward target).
     tracing::debug!("[Server] Authenticating client");
-    let (mut reader, writer) = tokio::io::split(tls_stream);
-    authenticate_client(&mut reader, &password_hash, &padding).await?;
+    let (prefix, prefix_len) = read_auth_prefix(&mut tls_stream).await?;
+    let authenticated = prefix_len == PASSWORD_DIGEST_SIZE + 2
+        && prefix[..PASSWORD_DIGEST_SIZE] == password_hash;
+    if !authenticated {
+        if let Some(target) = forward_target.as_ref() {
+            tracing::debug!(
+                "[Server] Authentication failed for {}; forwarding to {}:{}",
+                peer_addr,
+                target.host,
+                target.port
+            );
+            if let Err(e) = relay_forward_stream(&peer_addr, target, tls_stream, prefix).await {
+                tracing::debug!("[Server] Forward relay failed for {}: {}", peer_addr, e);
+            }
+            return Ok(());
+        }
+        tracing::debug!("[Server] Authentication failed for {}; no forward target", peer_addr);
+        return Err(AnyTlsError::AuthenticationFailed);
+    }
+    // Drain the auth padding so the session reader starts at the first frame.
+    let mut padding_len_bytes = [0u8; 2];
+    tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut padding_len_bytes).await?;
+    let padding_len = u16::from_be_bytes(padding_len_bytes) as usize;
+    if padding_len > 0 {
+        let mut padding_buf = vec![0u8; padding_len];
+        tokio::io::AsyncReadExt::read_exact(&mut tls_stream, &mut padding_buf).await?;
+    }
+    let (reader, writer) = tokio::io::split(tls_stream);
     tracing::debug!("[Server] Client authenticated");
 
     // Create callback channel for new streams
