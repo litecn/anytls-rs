@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut listen_addr = "127.0.0.1:1080".to_string();
     let mut http_listen_addr: Option<String> = None;
+    let mut mixed_listen_addr: Option<String> = None;
     let mut server_addr = "127.0.0.1:8443".to_string();
     let mut sni = None;
     let mut password = None;
@@ -48,6 +49,12 @@ async fn main() -> Result<()> {
                 http_listen_addr = Some(
                     args.next()
                         .context("Expected listen address after --http-listen")?,
+                );
+            }
+            "-m" | "--mixed" => {
+                mixed_listen_addr = Some(
+                    args.next()
+                        .context("Expected listen address after --mixed")?,
                 );
             }
             "-I" | "--idle-session-check-interval" => {
@@ -90,6 +97,10 @@ async fn main() -> Result<()> {
                     "                              (if ADDRESS equals -l, SOCKS5+HTTP share one mixed listener)"
                 );
                 println!(
+                    "  -m, --mixed ADDRESS     Enable mixed SOCKS5+HTTP listener on ADDRESS"
+                );
+                println!("                              (overrides -l; cannot be combined with -H)");
+                println!(
                     "  -I, --idle-session-check-interval SECS  Idle session check interval (default: 30)"
                 );
                 println!(
@@ -123,15 +134,22 @@ async fn main() -> Result<()> {
 
     let password = password.context("Password is required (use -p or --password)")?;
 
-    // Mixed mode is implied when -H is given the same address as -l: a single
-    // listener then serves both SOCKS5 and HTTP. A different -H address keeps
-    // the two listeners separate.
-    let mixed_listen = http_listen_addr
-        .as_deref()
-        .is_some_and(|http_addr| same_listen_addr(http_addr, &listen_addr));
-    if mixed_listen {
+    // -m explicitly enables the mixed SOCKS5+HTTP listener on the given
+    // address, overriding -l. When -m is absent the original behaviour is
+    // kept: mixed mode is implied when -H is given the same address as -l,
+    // while a different -H address keeps the two listeners separate.
+    if mixed_listen_addr.is_some() && http_listen_addr.is_some() {
+        return Err(anyhow!("-m/--mixed cannot be combined with -H/--http-listen"));
+    }
+    let mixed_listen_addr = mixed_listen_addr.or_else(|| {
+        http_listen_addr
+            .as_deref()
+            .filter(|http_addr| same_listen_addr(http_addr, &listen_addr))
+            .map(|_| listen_addr.clone())
+    });
+    if mixed_listen_addr.is_some() {
         // Consume http_listen_addr so the separate-listener branch below is not
-        // taken; the mixed listener already serves HTTP on -l.
+        // taken; the mixed listener already serves HTTP on its own address.
         http_listen_addr = None;
     }
 
@@ -164,8 +182,8 @@ async fn main() -> Result<()> {
 
     info!("{APP_NAME} v{VERSION}");
     info!("TLS SNI host: {}", effective_sni);
-    if mixed_listen {
-        info!("MIXED (SOCKS5+HTTP) {} => {}", listen_addr, server_addr);
+    if let Some(mixed_addr) = mixed_listen_addr.as_deref() {
+        info!("MIXED (SOCKS5+HTTP) {} => {}", mixed_addr, server_addr);
     } else if let Some(http_addr) = http_listen_addr.as_ref() {
         info!(
             "SOCKS5 {} + HTTP {} => {}",
@@ -188,8 +206,8 @@ async fn main() -> Result<()> {
     info!("Client ready");
 
     // Start proxy servers
-    if mixed_listen {
-        start_mixed_server(&listen_addr, client)
+    if let Some(mixed_addr) = mixed_listen_addr {
+        start_mixed_server(&mixed_addr, client)
             .await
             .context("MIXED server error")?;
     } else if let Some(http_addr) = http_listen_addr {
