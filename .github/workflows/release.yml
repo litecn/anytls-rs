@@ -179,7 +179,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}-${{ github.ref_name }}
+          name: ${{ matrix.artifact_name }}-${{ github.event.inputs.version || github.ref_name }}
           path: |
             ${{ env.ARTIFACT_PATH }}
           if-no-files-found: error
@@ -194,7 +194,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: anytls-*-${{ github.ref_name }}
+          pattern: anytls-*-${{ github.event.inputs.version || github.ref_name }}
           merge-multiple: true
 
       - name: Generate checksums
@@ -216,7 +216,7 @@ jobs:
       - name: Upload checksums
         uses: actions/upload-artifact@v4
         with:
-          name: checksums-${{ github.ref_name }}
+          name: checksums-${{ github.event.inputs.version || github.ref_name }}
           path: artifacts/*.sha256
           retention-days: 90
 
@@ -245,7 +245,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: anytls-*-${{ github.ref_name }}
+          pattern: anytls-*-${{ github.event.inputs.version || github.ref_name }}
           merge-multiple: true
 
       - name: Download checksums
