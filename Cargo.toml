@@ -28,8 +28,11 @@ tokio = { version = "1.48", features = [
 ] }
 
 # TLS
-rustls = "0.23"
-tokio-rustls = "0.26"
+# Use the ring backend instead of the default aws-lc-rs: aws-lc's AVX-512/GFNI
+# assembly SIGILLs on older VPS CPUs (e.g. racknerd), and it requires cmake/nasm
+# to build. ring is already used by rcgen, so this unifies the crypto stack.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rcgen = "0.14"  # Certificate generation
 rustls-pemfile = "2"
 
