@@ -11,7 +11,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
+use tokio_util::sync::PollSender;
 use tracing::{field, info_span};
+
+/// Capacity of the per-session stream->wire queue, in frames.
+/// Bounds memory when the remote consumer is slower than the sources feeding
+/// streams (jxo-me/anytls-rs#3 OOM). 64 frames x ~8KiB ≈ 512KiB per session.
+pub const STREAM_DATA_QUEUE_CAPACITY: usize = 64;
 
 static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use tokio_util::codec::Decoder;
@@ -33,7 +39,7 @@ struct HeartbeatState {
 }
 
 /// Session manages multiple streams over a single TLS connection
-type StreamDataReceiver = mpsc::UnboundedReceiver<(u32, Bytes)>;
+type StreamDataReceiver = mpsc::Receiver<(u32, Bytes)>;
 
 pub struct Session {
     id: u64,
@@ -45,8 +51,8 @@ pub struct Session {
     streams: Arc<RwLock<HashMap<u32, Arc<Stream>>>>,
     stream_id: Arc<std::sync::atomic::AtomicU32>,
 
-    // Channel for receiving data from streams
-    stream_data_tx: mpsc::UnboundedSender<(u32, Bytes)>,
+    // Channel for receiving data from streams (bounded; producers apply backpressure)
+    stream_data_tx: PollSender<(u32, Bytes)>,
     stream_data_rx: Arc<tokio::sync::Mutex<Option<StreamDataReceiver>>>,
 
     // Channel for sending data to streams (stream_id -> sender)
@@ -115,7 +121,9 @@ impl Session {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let (stream_data_tx, stream_data_rx) = mpsc::unbounded_channel();
+        let (stream_data_tx, stream_data_rx) =
+            mpsc::channel::<(u32, Bytes)>(STREAM_DATA_QUEUE_CAPACITY);
+        let stream_data_tx = PollSender::new(stream_data_tx);
         let id = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let heartbeat_state = heartbeat.map(|cfg| {
             Arc::new(HeartbeatState {
@@ -156,7 +164,9 @@ impl Session {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let (stream_data_tx, stream_data_rx) = mpsc::unbounded_channel();
+        let (stream_data_tx, stream_data_rx) =
+            mpsc::channel::<(u32, Bytes)>(STREAM_DATA_QUEUE_CAPACITY);
+        let stream_data_tx = PollSender::new(stream_data_tx);
         let id = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Self {

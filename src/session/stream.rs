@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+use tokio_util::sync::{PollSendError, PollSender};
 
 /// Stream represents a single data stream within a Session
 /// It implements AsyncRead and AsyncWrite to be used as a connection
@@ -23,7 +24,9 @@ pub struct Stream {
     reader: Arc<tokio::sync::Mutex<StreamReader>>,
 
     // ===== 写入部分：直接使用 channel，无需锁 =====
-    writer_tx: mpsc::UnboundedSender<(u32, Bytes)>,
+    // 有界 sender：队列满时 send_data/poll_write 挂起，形成对上游（网站/本地客户端）
+    // 的天然 TCP 背压，防止慢消费者场景下内存无界增长（jxo-me/anytls-rs#3 OOM）。
+    writer_tx: PollSender<(u32, Bytes)>,
 
     // ===== SYNACK 通知 (用于超时检测) =====
     synack_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<()>>>>>,
@@ -39,14 +42,14 @@ impl Stream {
     /// # Arguments
     /// * `id` - Stream ID
     /// * `reader` - StreamReader 用于读取数据
-    /// * `writer_tx` - 发送数据到 Session 的 channel
+    /// * `writer_tx` - 发送数据到 Session 的有界 channel sender
     ///
     /// # Returns
     /// (Stream, Receiver) - The receiver can be used to wait for SYNACK
     pub fn new(
         id: u32,
         reader: StreamReader,
-        writer_tx: mpsc::UnboundedSender<(u32, Bytes)>,
+        writer_tx: PollSender<(u32, Bytes)>,
     ) -> (Self, oneshot::Receiver<Result<()>>) {
         let (synack_tx, synack_rx) = oneshot::channel();
 
@@ -120,12 +123,16 @@ impl Stream {
 
     /// Send data through the writer channel (无锁方式)
     ///
-    /// 这个方法可以被多个任务并发调用，无需任何锁
-    pub fn send_data(
+    /// 这个方法可以被多个任务并发调用，无需任何锁。
+    /// 队列满时异步等待消费端腾出容量（背压），而不是无限入队。
+    pub async fn send_data(
         &self,
         data: Bytes,
-    ) -> std::result::Result<(), mpsc::error::SendError<(u32, Bytes)>> {
-        self.writer_tx.send((self.id, data))
+    ) -> std::result::Result<(), PollSendError<(u32, Bytes)>> {
+        let mut tx = self.writer_tx.clone();
+        // Wait until the bounded queue has capacity (backpressure), then enqueue.
+        std::future::poll_fn(|cx| tx.poll_reserve(cx)).await?;
+        tx.send_item((self.id, data))
     }
 }
 
@@ -182,7 +189,7 @@ impl AsyncRead for Stream {
 impl AsyncWrite for Stream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let stream_id = self.id;
@@ -201,21 +208,34 @@ impl AsyncWrite for Stream {
             )));
         }
 
-        // Send data to session via channel
-        let data = Bytes::copy_from_slice(buf);
-        tracing::trace!(
-            "[Stream] poll_write: Sending {} bytes to channel for stream {}",
-            buf_len,
-            stream_id
-        );
-        match self.writer_tx.send((self.id, data)) {
-            Ok(_) => {
+        // Reserve a slot in the bounded session queue; if full, return Pending so
+        // the caller stops producing (backpressure) instead of growing memory.
+        let this = self.get_mut();
+        match std::task::ready!(this.writer_tx.poll_reserve(cx)) {
+            Ok(()) => {
+                let data = Bytes::copy_from_slice(buf);
+                tracing::trace!(
+                    "[Stream] poll_write: Sending {} bytes to channel for stream {}",
+                    buf_len,
+                    stream_id
+                );
+                if let Err(e) = this.writer_tx.send_item((stream_id, data)) {
+                    tracing::error!(
+                        "[Stream] poll_write: send_item failed for stream {}: {:?}",
+                        stream_id,
+                        e
+                    );
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "session channel closed",
+                    )));
+                }
                 tracing::debug!(
                     "[Stream] poll_write: Successfully sent {} bytes to channel for stream {}",
                     buf_len,
                     stream_id
                 );
-                Poll::Ready(Ok(buf.len()))
+                Poll::Ready(Ok(buf_len))
             }
             Err(e) => {
                 tracing::error!(
@@ -248,10 +268,16 @@ mod tests {
     use super::*;
     use crate::session::StreamReader;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    fn bounded_tx(cap: usize) -> (PollSender<(u32, Bytes)>, mpsc::Receiver<(u32, Bytes)>) {
+        let (tx, rx) = mpsc::channel(cap);
+        (PollSender::new(tx), rx)
+    }
 
     #[tokio::test]
     async fn test_stream_write() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = bounded_tx(8);
         let (_reader_tx, reader_rx) = mpsc::unbounded_channel();
 
         let reader = StreamReader::new(1, reader_rx);
@@ -266,9 +292,62 @@ mod tests {
         assert_eq!(data.as_ref(), b"hello");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_send_data_backpressure() {
+        // Queue capacity 1: the second send must wait for the consumer instead of
+        // growing memory unbounded (jxo-me/anytls-rs#3 OOM regression).
+        let (tx, _rx) = bounded_tx(1);
+        let (_reader_tx, reader_rx) = mpsc::unbounded_channel();
+        let reader = StreamReader::new(1, reader_rx);
+        let (stream, _synack_rx) = Stream::new(1, reader, tx);
+
+        stream.send_data(Bytes::from("a")).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            stream.send_data(Bytes::from("b")),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "send_data must apply backpressure when the queue is full"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_send_data_unblocks_on_receiver_drop() {
+        // Regression for the bounded-queue switch: when the queue is full and a
+        // producer is parked in poll_reserve, closing the session (which drops
+        // the receiver) must wake the producer with an error instead of hanging
+        // forever and leaking the forwarding task.
+        let (tx, rx) = bounded_tx(1);
+        let (_reader_tx, reader_rx) = mpsc::unbounded_channel();
+        let reader = StreamReader::new(1, reader_rx);
+        let (stream, _synack_rx) = Stream::new(1, reader, tx);
+
+        // Fill the queue so the next send parks in poll_reserve.
+        stream.send_data(Bytes::from("a")).await.unwrap();
+
+        let handle =
+            tokio::spawn(async move { stream.send_data(Bytes::from("b")).await });
+
+        // Let the task park in poll_reserve, then simulate session close by
+        // dropping the receiver.
+        tokio::task::yield_now().await;
+        drop(rx);
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("send_data must not hang after the receiver is dropped");
+        assert!(
+            res.unwrap().is_err(),
+            "send_data must fail once the channel is closed"
+        );
+    }
+
     #[tokio::test]
     async fn test_stream_read() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = bounded_tx(8);
         let (reader_tx, reader_rx) = mpsc::unbounded_channel();
 
         let reader = StreamReader::new(1, reader_rx);
@@ -287,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_read_write() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = bounded_tx(8);
         let (reader_tx, reader_rx) = mpsc::unbounded_channel();
 
         let reader = StreamReader::new(1, reader_rx);
