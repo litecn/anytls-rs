@@ -33,9 +33,11 @@ pub async fn start_mixed_server(listen_addr: &str, client: Arc<Client>) -> Resul
 
     tracing::info!("[MIXED] Listening on {}", listen_addr);
 
+    let mut accept_backoff_us: u64 = 0;
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                accept_backoff_us = 0;
                 let client = Arc::clone(&client);
                 tokio::spawn(async move {
                     if let Err(e) = handle_mixed_connection(stream, client).await {
@@ -44,7 +46,7 @@ pub async fn start_mixed_server(listen_addr: &str, client: Arc<Client>) -> Resul
                 });
             }
             Err(e) => {
-                tracing::error!("[MIXED] Accept error: {}", e);
+                crate::util::handle_accept_error("MIXED", &e, &mut accept_backoff_us).await;
             }
         }
     }

@@ -270,6 +270,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
+    #[allow(clippy::type_complexity)]
     fn bounded_tx(cap: usize) -> (PollSender<(u32, Bytes)>, mpsc::Receiver<(u32, Bytes)>) {
         let (tx, rx) = mpsc::channel(cap);
         (PollSender::new(tx), rx)

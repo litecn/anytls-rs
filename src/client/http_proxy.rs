@@ -18,9 +18,11 @@ pub async fn start_http_proxy_server(listen_addr: &str, client: Arc<Client>) -> 
     let listener = TcpListener::bind(listen_addr).await?;
     tracing::info!("[HTTP] Listening on {}", listen_addr);
 
+    let mut accept_backoff_us: u64 = 0;
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                accept_backoff_us = 0;
                 tracing::debug!("[HTTP] New connection from {}", addr);
                 let client_clone = Arc::clone(&client);
                 tokio::spawn(async move {
@@ -30,7 +32,7 @@ pub async fn start_http_proxy_server(listen_addr: &str, client: Arc<Client>) -> 
                 });
             }
             Err(e) => {
-                tracing::error!("[HTTP] Accept error: {}", e);
+                crate::util::handle_accept_error("HTTP", &e, &mut accept_backoff_us).await;
             }
         }
     }

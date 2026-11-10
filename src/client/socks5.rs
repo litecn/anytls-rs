@@ -61,9 +61,11 @@ pub async fn start_socks5_server(listen_addr: &str, client: Arc<Client>) -> Resu
 
     tracing::info!("[SOCKS5] Listening on {}", listen_addr);
 
+    let mut accept_backoff_us: u64 = 0;
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                accept_backoff_us = 0;
                 tracing::debug!("[SOCKS5] New connection from {}", addr);
 
                 let client_clone = Arc::clone(&client);
@@ -74,7 +76,7 @@ pub async fn start_socks5_server(listen_addr: &str, client: Arc<Client>) -> Resu
                 });
             }
             Err(e) => {
-                tracing::error!("[SOCKS5] Accept error: {}", e);
+                crate::util::handle_accept_error("SOCKS5", &e, &mut accept_backoff_us).await;
             }
         }
     }

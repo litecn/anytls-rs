@@ -82,9 +82,11 @@ impl Server {
 
         tracing::info!("[Server] Listening on {}", addr);
 
+        let mut accept_backoff_us: u64 = 0;
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    accept_backoff_us = 0;
                     let tls_config = self.tls_config.read().unwrap().clone();
                     let password_hash = self.password_hash;
                     let padding = Arc::clone(&self.padding);
@@ -115,7 +117,7 @@ impl Server {
                     );
                 }
                 Err(e) => {
-                    tracing::error!("[Server] Accept error: {}", e);
+                    crate::util::handle_accept_error("Server", &e, &mut accept_backoff_us).await;
                 }
             }
         }
