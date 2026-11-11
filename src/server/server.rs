@@ -3,6 +3,7 @@
 use crate::padding::PaddingFactory;
 use crate::server::forward::{ForwardTarget, read_auth_prefix, relay_forward_stream};
 use crate::server::handler::{StreamHandler, TcpProxyHandler};
+use crate::server::outbound_proxy::OutboundProxy;
 use crate::session::Session;
 use crate::util::{
     AnyTlsError, Result, StringMap, configure_tcp_stream, hash_password, PASSWORD_DIGEST_SIZE,
@@ -20,6 +21,7 @@ pub struct Server {
     on_new_stream: Option<Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>>,
     server_settings: Option<StringMap>,
     forward_target: Option<ForwardTarget>,
+    outbound_proxy: Option<Arc<OutboundProxy>>,
 }
 
 impl Server {
@@ -39,6 +41,7 @@ impl Server {
             on_new_stream: None,
             server_settings,
             forward_target: None,
+            outbound_proxy: None,
         }
     }
 
@@ -58,6 +61,7 @@ impl Server {
             on_new_stream: None,
             server_settings,
             forward_target: None,
+            outbound_proxy: None,
         }
     }
 
@@ -73,6 +77,13 @@ impl Server {
     /// Relay unauthenticated connections to the given target instead of dropping them
     pub fn with_forward_target(mut self, target: ForwardTarget) -> Self {
         self.forward_target = Some(target);
+        self
+    }
+
+    /// Route outbound proxy traffic (TCP and UDP-over-TCP targets) through an
+    /// upstream SOCKS5 proxy
+    pub fn with_outbound_proxy(mut self, proxy: OutboundProxy) -> Self {
+        self.outbound_proxy = Some(Arc::new(proxy));
         self
     }
 
@@ -93,6 +104,7 @@ impl Server {
                     let on_new_stream = self.on_new_stream.clone();
                     let server_settings = self.server_settings.clone();
                     let forward_target = self.forward_target.clone();
+                    let outbound_proxy = self.outbound_proxy.clone();
                     let span = info_span!(
                         "anytls.connection",
                         peer_addr = %addr,
@@ -107,7 +119,10 @@ impl Server {
                                 password_hash,
                                 padding,
                                 on_new_stream,
-                                server_settings,                                forward_target,                            )
+                                server_settings,
+                                forward_target,
+                                outbound_proxy,
+                            )
                             .await
                             {
                                 tracing::error!("[Server] Connection error: {}", e);
@@ -133,6 +148,7 @@ async fn handle_connection(
     on_new_stream: Option<Arc<dyn Fn(Arc<crate::session::Stream>) + Send + Sync + 'static>>,
     server_settings: Option<StringMap>,
     forward_target: Option<ForwardTarget>,
+    outbound_proxy: Option<Arc<OutboundProxy>>,
 ) -> Result<()> {
     let peer_addr = tcp_stream
         .peer_addr()
@@ -259,7 +275,10 @@ async fn handle_connection(
                 let stream_clone = Arc::clone(&stream);
                 let session_clone = Arc::clone(&session_for_handler);
                 // Create a new handler instance for each stream (TcpProxyHandler is small and stateless)
-                let handler = TcpProxyHandler::new();
+                let handler = match outbound_proxy.as_ref() {
+                    Some(proxy) => TcpProxyHandler::with_outbound_proxy(Arc::clone(proxy)),
+                    None => TcpProxyHandler::new(),
+                };
                 let stream_id = stream_clone.id();
                 let stream_span = info_span!(
                     "anytls.stream.proxy",

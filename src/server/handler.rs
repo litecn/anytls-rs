@@ -1,6 +1,7 @@
 //! Server connection handlers
 
 use crate::protocol::{Command, Frame};
+use crate::server::outbound_proxy::OutboundProxy;
 use crate::session::{Session, Stream};
 use crate::util::{AnyTlsError, Result, configure_tcp_stream, resolve_host_with_cache};
 use bytes::Bytes;
@@ -23,7 +24,8 @@ pub trait StreamHandler: Send + Sync {
 
 /// Default stream handler that proxies TCP connections
 pub struct TcpProxyHandler {
-    // Destination will be read from stream
+    // Optional upstream SOCKS5 proxy for outbound connections
+    outbound_proxy: Option<Arc<OutboundProxy>>,
 }
 
 impl Default for TcpProxyHandler {
@@ -33,9 +35,19 @@ impl Default for TcpProxyHandler {
 }
 
 impl TcpProxyHandler {
-    /// Create a new TCP proxy handler
+    /// Create a new TCP proxy handler (direct outbound connections)
     pub fn new() -> Self {
-        Self {}
+        Self {
+            outbound_proxy: None,
+        }
+    }
+
+    /// Create a new TCP proxy handler that relays outbound connections
+    /// through an upstream SOCKS5 proxy
+    pub fn with_outbound_proxy(proxy: Arc<OutboundProxy>) -> Self {
+        Self {
+            outbound_proxy: Some(proxy),
+        }
     }
 }
 
@@ -83,7 +95,8 @@ impl StreamHandler for TcpProxyHandler {
                         return Err(e);
                     }
                 }
-                crate::server::udp_proxy::handle_udp_over_tcp(stream).await
+                crate::server::udp_proxy::handle_udp_over_tcp(stream, self.outbound_proxy.clone())
+                    .await
             } else {
                 // Regular TCP proxy
                 proxy_tcp_connection_with_synack_internal(
@@ -92,6 +105,7 @@ impl StreamHandler for TcpProxyHandler {
                     stream_id,
                     peer_version,
                     destination,
+                    self.outbound_proxy.clone(),
                 )
                 .await
             }
@@ -246,6 +260,7 @@ async fn proxy_tcp_connection_with_synack_internal(
     stream_id: u32,
     peer_version: u8,
     destination: SocksAddr,
+    outbound_proxy: Option<Arc<OutboundProxy>>,
 ) -> Result<()> {
     tracing::debug!(
         "[Proxy] proxy_tcp_connection_with_synack: Starting for stream {} (peer_version={})",
@@ -259,11 +274,24 @@ async fn proxy_tcp_connection_with_synack_internal(
     );
 
     let target_display = format!("{}:{}", destination.addr, destination.port);
-    let target_socket = if let Ok(ip) = destination.addr.parse::<IpAddr>() {
-        SocketAddr::new(ip, destination.port)
-    } else {
-        resolve_host_with_cache(&destination.addr, destination.port)
-            .await
+    // When an upstream SOCKS5 proxy is configured, hand the (possibly domain)
+    // target to the proxy unresolved; otherwise resolve locally and connect
+    // directly.
+    let proxy_display = outbound_proxy
+        .as_ref()
+        .map(|proxy| format!(" (via outbound proxy {proxy})"))
+        .unwrap_or_default();
+    let connect_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<TcpStream>> + Send>> =
+        if let Some(proxy) = outbound_proxy.as_ref() {
+            let host = destination.addr.clone();
+            let port = destination.port;
+            Box::pin(async move { proxy.tcp_connect(&host, port).await })
+        } else {
+            let target_socket = if let Ok(ip) = destination.addr.parse::<IpAddr>() {
+                Ok(SocketAddr::new(ip, destination.port))
+            } else {
+                resolve_host_with_cache(&destination.addr, destination.port).await
+            }
             .map_err(|err| {
                 tracing::error!(
                     "[Proxy] DNS resolution failed for {}: {}",
@@ -271,17 +299,22 @@ async fn proxy_tcp_connection_with_synack_internal(
                     err
                 );
                 err
-            })?
-    };
+            })?;
+            Box::pin(async move { Ok(TcpStream::connect(target_socket).await?) })
+        };
 
     // Create outbound TCP connection with timeout
     // Default 15s timeout for DNS resolution + TCP handshake
     // This prevents hanging on slow/unreachable targets
     let connect_timeout = Duration::from_secs(15);
-    let outbound = match timeout(connect_timeout, TcpStream::connect(target_socket)).await {
+    let outbound = match timeout(connect_timeout, connect_fut).await {
         Ok(Ok(conn)) => {
             configure_tcp_stream(&conn, &target_display);
-            tracing::info!("[Proxy] Successfully connected to {}", target_display);
+            tracing::info!(
+                "[Proxy] Successfully connected to {}{}",
+                target_display,
+                proxy_display
+            );
             conn
         }
         Ok(Err(e)) => {

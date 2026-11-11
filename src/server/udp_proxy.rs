@@ -18,13 +18,13 @@
 //!
 //! Reference: <https://github.com/SagerNet/sing-box/blob/dev-next/docs/configuration/shared/udp-over-tcp.md>
 
+use crate::server::outbound_proxy::{OutboundProxy, UdpOutbound};
 use crate::session::{Stream, StreamReader};
 use crate::util::{AnyTlsError, Result, resolve_host_with_cache};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::net::UdpSocket;
 use tracing::{field, info_span};
 
 const MAX_UDP_PACKET_SIZE: usize = 65535;
@@ -41,7 +41,10 @@ const MAX_UDP_PACKET_SIZE: usize = 65535;
 /// 3. Bidirectional forwarding between Stream and UDP socket
 ///
 /// Reference: <https://github.com/SagerNet/sing-box/blob/dev-next/docs/configuration/shared/udp-over-tcp.md>
-pub async fn handle_udp_over_tcp(stream: Arc<Stream>) -> Result<()> {
+pub async fn handle_udp_over_tcp(
+    stream: Arc<Stream>,
+    outbound_proxy: Option<Arc<OutboundProxy>>,
+) -> Result<()> {
     let stream_id = stream.id();
     let udp_span = info_span!(
         "anytls.udp.proxy",
@@ -75,14 +78,29 @@ pub async fn handle_udp_over_tcp(stream: Arc<Stream>) -> Result<()> {
 
     drop(reader_guard);
 
-    // Step 2: Create UDP socket (bind to any available port)
-    let udp_socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-        tracing::error!("[UDP] Failed to create UDP socket: {}", e);
-        AnyTlsError::Io(e)
-    })?;
+    // Step 2: Create UDP outbound (direct socket, or relayed through the
+    // configured upstream SOCKS5 proxy)
+    let udp_outbound = if let Some(proxy) = outbound_proxy.as_ref() {
+        match proxy.udp_associate().await {
+            Ok(associate) => {
+                tracing::debug!("[UDP] Using SOCKS5 UDP relay via {proxy}");
+                UdpOutbound::Proxied(associate)
+            }
+            Err(e) => {
+                tracing::error!("[UDP] Failed to create SOCKS5 UDP association via {proxy}: {e}");
+                return Err(e);
+            }
+        }
+    } else {
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
+            tracing::error!("[UDP] Failed to create UDP socket: {}", e);
+            AnyTlsError::Io(e)
+        })?;
+        UdpOutbound::Direct(socket)
+    };
 
-    let local_addr = udp_socket.local_addr()?;
-    tracing::debug!("[UDP] Created UDP socket on {}", local_addr);
+    let local_addr = udp_outbound.local_addr()?;
+    tracing::debug!("[UDP] Created UDP outbound on {}", local_addr);
     udp_span.record("local_udp", field::display(local_addr));
 
     let packets_stream_to_udp = Arc::new(AtomicU64::new(0));
@@ -97,7 +115,7 @@ pub async fn handle_udp_over_tcp(stream: Arc<Stream>) -> Result<()> {
     tokio::select! {
         result = stream_to_udp(
             &stream,
-            &udp_socket,
+            &udp_outbound,
             &target_addr,
             Arc::clone(&packets_stream_to_udp),
             Arc::clone(&bytes_stream_to_udp)
@@ -109,7 +127,7 @@ pub async fn handle_udp_over_tcp(stream: Arc<Stream>) -> Result<()> {
         }
         result = udp_to_stream(
             &stream,
-            &udp_socket,
+            &udp_outbound,
             &target_addr,
             Arc::clone(&packets_udp_to_stream),
             Arc::clone(&bytes_udp_to_stream)
@@ -264,7 +282,7 @@ async fn read_initial_request(reader: &mut StreamReader) -> Result<SocketAddr> {
 /// The payload is pure UDP data (target address already known from initial request)
 async fn stream_to_udp(
     stream: &Stream,
-    udp: &UdpSocket,
+    udp: &UdpOutbound,
     target_addr: &SocketAddr,
     packets_counter: Arc<AtomicU64>,
     bytes_counter: Arc<AtomicU64>,
@@ -301,7 +319,7 @@ async fn stream_to_udp(
         );
 
         // Send to UDP (target address already known from initial request)
-        let sent = udp.send_to(&payload, target_addr).await?;
+        let sent = udp.send_to(&payload, *target_addr).await?;
 
         if sent != payload.len() {
             tracing::warn!("[UDP] Partial UDP send: {} / {} bytes", sent, payload.len());
@@ -320,7 +338,7 @@ async fn stream_to_udp(
 /// we just send the data since the connection is already established)
 async fn udp_to_stream(
     stream: &Stream,
-    udp: &UdpSocket,
+    udp: &UdpOutbound,
     _target_addr: &SocketAddr,
     packets_counter: Arc<AtomicU64>,
     bytes_counter: Arc<AtomicU64>,
@@ -337,7 +355,7 @@ async fn udp_to_stream(
             Ok((len, addr)) => (len, addr),
             Err(e) => {
                 tracing::error!("[UDP] Failed to receive from UDP: {}", e);
-                return Err(AnyTlsError::Io(e));
+                return Err(e);
             }
         };
 

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use anytls_rs::padding::PaddingFactory;
-use anytls_rs::server::{ForwardTarget, Server};
+use anytls_rs::server::{ForwardTarget, OutboundProxy, Server};
 use anytls_rs::util::{
     CertReloader, CertReloaderConfig, StringMap, create_server_config, set_custom_dns_servers,
 };
@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
     let mut expiry_warning_days: u64 = 30;
     let mut dns_servers: Vec<String> = Vec::new();
     let mut forward_target: Option<String> = None;
+    let mut outbound_proxy: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -108,6 +109,12 @@ async fn main() -> Result<()> {
                         .context("Expected forward URL after --forward")?,
                 );
             }
+            "--outbound-proxy" => {
+                outbound_proxy = Some(
+                    args.next()
+                        .context("Expected proxy URL after --outbound-proxy")?,
+                );
+            }
             "-V" | "--version" => {
                 println!("{APP_NAME} {VERSION}");
                 return Ok(());
@@ -147,6 +154,9 @@ async fn main() -> Result<()> {
                 println!("Forwarding Options:");
                 println!(
                     "      --forward URL          Relay unauthenticated connections to this http(s):// URL"
+                );
+                println!(
+                    "      --outbound-proxy URL   Route outbound traffic through this socks5://[user:pass@]host:port proxy"
                 );
                 #[cfg(unix)]
                 {
@@ -268,6 +278,13 @@ async fn main() -> Result<()> {
             target.port
         );
         server = server.with_forward_target(target);
+    }
+
+    if let Some(url) = outbound_proxy.as_deref() {
+        let proxy = OutboundProxy::parse(url)
+            .map_err(|e| anyhow::anyhow!("Invalid --outbound-proxy URL: {e}"))?;
+        info!("[Server] Outbound traffic will be routed via SOCKS5 proxy {proxy}");
+        server = server.with_outbound_proxy(proxy);
     }
 
     // Start certificate file watching if enabled

@@ -141,6 +141,7 @@ anytls-rs/
 | `-I, --idle-session-check-interval <SECS>` | 推荐给客户端的检查间隔 |
 | `-T, --idle-session-timeout <SECS>` | 推荐空闲超时 |
 | `-M, --min-idle-session <COUNT>` | 推荐保持的空闲会话数 |
+| `--outbound-proxy <URL>` | 出站流量走上游 SOCKS5 代理：`socks5://[user:pass@]host:port` |
 | `-V, --version` | 显示版本信息 |
 | `-h, --help` | 显示帮助信息 |
 

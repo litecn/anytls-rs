@@ -140,6 +140,7 @@ For a responsibility-oriented overview, see `docs/00-project-radar.md`.
 | `-I, --idle-session-check-interval <SECS>` | Hint for clients (recommended check interval) |
 | `-T, --idle-session-timeout <SECS>` | Hint for idle timeout |
 | `-M, --min-idle-session <COUNT>` | Hint for minimum warm idle sessions |
+| `--outbound-proxy <URL>` | Route outbound traffic through an upstream SOCKS5 proxy: `socks5://[user:pass@]host:port` |
 | `-V, --version` | Show version information |
 | `-h, --help` | Show help message |
 
