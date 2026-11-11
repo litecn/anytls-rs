@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file. Dates use `YYYY-MM-DD`.
 
+## [0.5.6] - 2026-11-11
+
+### Added
+- **Outbound SOCKS5 Proxy (`--outbound-proxy`)**: the server can route its outbound traffic through an upstream SOCKS5 proxy (`socks5://[user:pass@]host:port`)
+  - TCP targets connect via SOCKS5 CONNECT, with optional RFC 1929 username/password auth and remote (socks5h) domain resolution by the proxy
+  - UDP-over-TCP relays use SOCKS5 UDP ASSOCIATE with RFC 1928 UDP framing
+  - Implemented natively without extra dependencies; direct outbound behavior is unchanged when the option is absent
+  - Ported from ssrlive/anytls-rs (commit "add outbound proxy for server")
+
 ## [0.5.4] - 2025-11-11
 
 ### Added
