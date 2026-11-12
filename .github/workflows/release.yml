@@ -149,15 +149,8 @@ jobs:
           fi
           VERSION=${VERSION#v}
           ARTIFACT_NAME="${{ matrix.artifact_name }}-${VERSION}"
-          ARTIFACT_DIR="release"
+          ARTIFACT_DIR="release-dist"
           mkdir -p "${ARTIFACT_DIR}"
-          cp LICENSE README.md README.en.md "${ARTIFACT_DIR}/"
-          if [ -f docs/CHANGELOG.md ]; then
-            cp docs/CHANGELOG.md "${ARTIFACT_DIR}/"
-          fi
-          if ls docs/RELEASE_NOTES_*.md >/dev/null 2>&1; then
-            cp docs/RELEASE_NOTES_*.md "${ARTIFACT_DIR}/"
-          fi
 
           if [ "${{ matrix.archive_ext }}" == "zip" ]; then
             # Windows
